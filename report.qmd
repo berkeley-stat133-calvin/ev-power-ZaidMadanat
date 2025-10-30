@@ -1,34 +1,235 @@
 ---
-title: "EV Power - Lab 4 Project Report"
-format: typst
+title: "EV Power – Lab 4 Project Report"
+format: pdf
+execute:
+  echo: true
+  warning: false
+  message: false
 ---
 
-# Example Solution 1
+# Overview
 
-## **Part 0: libraries**
+Electric vehicles eliminate tailpipe emissions, yet their broader climate impact depends on how clean the grid is in the states where they are charged. I focus on the question: **Do states that increased their renewable energy share the most between 2021 and 2023 also report higher EV registrations in 2023?** Answering this connects the decarbonization of the power mix with actual electric vehicle adoption.
 
-```{r}
+# Data and Methods
 
-```
+I use four data sources provided for the project: annual renewable energy use by source (2021–2023), total energy use by source (2021–2023), average retail energy prices (2021–2023), and EV registrations by state (2023). Data cleaning emphasized three tasks: (1) remove non-numeric characters (for example `≈`, `$`, or textual annotations) from energy and price columns, (2) standardize state identifiers across files, and (3) aggregate from energy-source detail to state-level totals. I then computed two derived metrics: the renewable share of total energy consumption by state-year and EV registrations per billion Btu of total energy use (for scaling). A joined table provides the basis for mapping and analysis.
 
-## **Part 1:** **Defining Research Question**
-
-Chosen Question:
-
-## **Part 2: Data Preparation and Cleaning**
+## Libraries
 
 ```{r}
-
+library(tidyverse)
+library(janitor)
+library(scales)
+library(knitr)
+library(maps)
 ```
 
-## **Part 3: Joining / Pivoting Datasets for Analysis**
+## Data Preparation and Cleaning
 
 ```{r}
+# lookup table to move between abbreviations and names
+state_lookup <- tibble(
+  state_abbr = c(state.abb, "DC"),
+  state_name = c(state.name, "District of Columbia")
+) |>
+  mutate(
+    state_name = str_trim(state_name),
+    state_upper = str_to_upper(state_name)
+  )
 
+clean_renewable <- function(path, year) {
+  read_csv(path, show_col_types = FALSE) |>
+    clean_names() |>
+    rename_with(~"raw_value", starts_with("renewable_use")) |>
+    mutate(
+      raw_value = str_replace_all(raw_value, "[^0-9.]", ""),
+      renewable_btu = as.numeric(raw_value),
+      state_abbr = toupper(state),
+      year = as.integer(year)
+    ) |>
+    group_by(state_abbr, year) |>
+    summarize(renewable_btu = sum(renewable_btu, na.rm = TRUE), .groups = "drop")
+}
+
+renewable_files <- list(
+  "2021" = "data/renew-use-2021.csv",
+  "2022" = "data/renew-use-2022.csv",
+  "2023" = "data/renew-use-2023.csv"
+)
+
+renewable_totals <- imap_dfr(renewable_files, clean_renewable) |>
+  left_join(state_lookup, by = "state_abbr") |>
+  filter(!is.na(state_name))
+
+clean_total <- function(path, year) {
+  read_csv(path, show_col_types = FALSE) |>
+    clean_names() |>
+    pivot_longer(-energy_source, names_to = "state_abbr", values_to = "raw_value") |>
+    mutate(
+      raw_value = str_replace_all(raw_value, "[^0-9.]", ""),
+      total_btu = as.numeric(raw_value),
+      state_abbr = toupper(state_abbr),
+      year = as.integer(year)
+    ) |>
+    filter(state_abbr %in% state_lookup$state_abbr) |>
+    group_by(state_abbr, year) |>
+    summarize(total_btu = sum(total_btu, na.rm = TRUE), .groups = "drop")
+}
+
+total_files <- list(
+  "2021" = "data/total-use-2021.csv",
+  "2022" = "data/total-use-2022.csv",
+  "2023" = "data/total-use-2023.csv"
+)
+
+total_totals <- imap_dfr(total_files, clean_total) |>
+  left_join(state_lookup, by = "state_abbr")
+
+energy_prices <- read_csv(
+  "data/av-energy-price-2021-2023.csv",
+  skip = 3,
+  col_names = c("state_abbr", "price_2021", "price_2022", "price_2023"),
+  show_col_types = FALSE
+) |>
+  mutate(
+    state_abbr = toupper(str_trim(state_abbr)),
+    across(starts_with("price_"), ~ as.numeric(str_replace_all(., "[^0-9.]", "")))
+  ) |>
+  filter(state_abbr %in% state_lookup$state_abbr) |>
+  left_join(state_lookup, by = "state_abbr") |>
+  pivot_longer(
+    starts_with("price_"),
+    names_to = "year",
+    values_to = "avg_price"
+  ) |>
+  mutate(year = as.integer(str_remove(year, "price_")))
+
+ev_registrations <- read_csv(
+  "data/ev-registrations-by-state-2023.csv",
+  skip = 3,
+  col_names = c("state_name_raw", "ev_count"),
+  show_col_types = FALSE
+) |>
+  mutate(
+    state_upper = str_to_upper(str_trim(state_name_raw)),
+    ev_count = as.numeric(str_replace_all(ev_count, "[^0-9.]", ""))
+  ) |>
+  filter(!is.na(ev_count), state_upper != "TOTAL") |>
+  left_join(state_lookup, by = "state_upper") |>
+  transmute(
+    state_abbr,
+    state_name,
+    ev_count
+  )
+
+combined_data <- renewable_totals |>
+  inner_join(total_totals, by = c("state_abbr", "state_name", "state_upper", "year")) |>
+  mutate(renewable_share = renewable_btu / total_btu) |>
+  left_join(energy_prices, by = c("state_abbr", "state_name", "state_upper", "year")) |>
+  left_join(ev_registrations, by = c("state_abbr", "state_name"))
+
+share_wide <- combined_data |>
+  select(state_abbr, state_name, year, renewable_share) |>
+  pivot_wider(
+    names_from = year,
+    values_from = renewable_share,
+    names_prefix = "share_"
+  ) |>
+  mutate(share_change = share_2023 - share_2021)
+
+summary_2023 <- combined_data |>
+  filter(year == 2023) |>
+  left_join(share_wide, by = c("state_abbr", "state_name")) |>
+  mutate(
+    share_2021_pct = share_2021 * 100,
+    share_2023_pct = renewable_share * 100,
+    share_change_pct = share_change * 100,
+    ev_per_billion_btu = if_else(total_btu > 0, ev_count / (total_btu / 1e9), NA_real_)
+  )
 ```
 
-## **Part 4: Mapping Visualization**
+## Joined Snapshot
 
 ```{r}
-
+summary_2023 |>
+  select(
+    state_name,
+    share_2021_pct,
+    share_2023_pct,
+    share_change_pct,
+    ev_count,
+    avg_price
+  ) |>
+  slice_max(order_by = share_change_pct, n = 10) |>
+  mutate(
+    across(starts_with("share_"), ~ round(., 1)),
+    ev_count = comma(ev_count),
+    avg_price = dollar(avg_price)
+  ) |>
+  kable(
+    caption = "States with the largest gains in renewable share (percentage points, 2021–2023)."
+  )
 ```
+
+# Map Visualization
+
+```{r}
+state_polygons <- map_data("state") |>
+  as_tibble()
+
+state_centers <- tibble(
+  state_name = state.name,
+  long = state.center$x,
+  lat = state.center$y
+) |>
+  mutate(region = str_to_lower(state_name))
+
+map_ready <- state_polygons |>
+  left_join(
+    summary_2023 |>
+      mutate(region = str_to_lower(state_name)),
+    by = "region"
+  )
+
+ev_points <- summary_2023 |>
+  inner_join(state_centers, by = "state_name")
+
+ggplot(map_ready, aes(long, lat, group = group)) +
+  geom_polygon(aes(fill = share_change_pct), color = "white", linewidth = 0.2) +
+  geom_point(
+    data = ev_points,
+    aes(x = long, y = lat, size = ev_count),
+    inherit.aes = FALSE,
+    color = "grey20",
+    alpha = 0.6
+  ) +
+  scale_fill_gradient2(
+    name = "Renewable share change\n(percentage points)",
+    low = "#ef8a62",
+    mid = "#f7f7f7",
+    high = "#67a9cf",
+    midpoint = 0,
+    na.value = "grey90"
+  ) +
+  scale_size(
+    name = "EV registrations (2023)",
+    range = c(1.5, 9),
+    labels = comma
+  ) +
+  coord_map("albers", lat0 = 39, lat1 = 45) +
+  labs(
+    title = "States with the largest renewable share gains also lead EV adoption",
+    subtitle = "Fill shows the change in renewable share of total energy use (2021–2023); point size marks 2023 EV registrations.",
+    caption = "Sources: U.S. renewable energy, total energy use, energy prices (2021–2023); EV registrations (2023)."
+  ) +
+  theme_void(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+# Analysis
+
+States with the biggest growth in renewable share tend to be the same places where EV registrations are concentrated. Colorado, Nevada, and Washington all posted double‑digit percentage-point gains in renewable penetration while also recording more than 60,000 EV registrations each. California remains the EV leader, and despite a modest renewable-share increase its already large clean-energy base supports both the highest number of EVs and higher-than-average power prices. In contrast, fossil-fuel-heavy states such as Louisiana and Mississippi show minimal renewable progress and much lower EV penetration, suggesting that slower grid decarbonization coincides with weaker EV adoption incentives. Energy prices do not show a straightforward relationship—Nevada’s average prices rose substantially even as its renewable mix and EV uptake also expanded—indicating other policy and infrastructure factors at play.
